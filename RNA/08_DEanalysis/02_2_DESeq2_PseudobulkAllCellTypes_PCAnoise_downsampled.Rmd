@@ -1,0 +1,219 @@
+---
+title: "DESeq2 Full Pseudobulk across cell types and calculation of PC noise"
+author: "Nathalie"
+date: '2022-08-11'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## 0. Load Packages
+
+```{r}
+# load edgeR which loads limma as dependency
+library(DESeq2)
+library(edgeR)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(tidyverse)
+library(magrittr)
+library(variancePartition)
+library(PCAtools)
+library(lattice)
+library(sva)
+```
+
+## 1. Setup
+
+Define pathes, cell type of interest and model.
+
+```{r pressure}
+# define pathes to data and folders
+base_workspace <- '~/Documents/PostmortemBrain/workspace/'
+basedir <- paste0(base_workspace, 'scripts/RNA/08_DEanalysis/DESeq2_RELN/')
+
+# source file with functions needed
+source(paste0(basedir,"00_functions.R"))
+
+cluster <- "All"
+
+# percentile of downsampling
+perc <- 75
+
+# cutoff --> which proportion of sample needs to be expressed for gene to be kept?
+# set here to 0.9 as this is part of quality control and makes sense to be stricter
+cutoff_sample <- 0.9
+
+des <- "~ Status + Sex + Age + Brain.pH + RIN + PMI + X6.Batch"
+des_null <- "~ Sex + Age + Brain.pH + RIN + PMI + X6.Batch"
+des_varPart <- "~ (1|Status) + (1|Sex) + Age + Brain.pH + RIN + PMI + (1|X6.Batch)"
+```
+
+# 2. Preprocessing of data
+
+```{r}
+# Read count and metadata
+counts <- readRDS(paste0(basedir, "data/counts_perc", perc, ".rds"))
+metadata <- readRDS(paste0(basedir, "data/metadata_perc", perc, ".rds"))
+metadata$Mode.of.death <- as.factor(str_replace_all(metadata$Mode.of.death, " ", ""))
+
+
+# Prepare count data
+counts$row_id <- rownames(counts)
+counts_sum <- counts %>%
+  separate("row_id", into = c("celltype", "sample_id"), sep = "__") %>%
+  select(-celltype) %>%
+  group_by(sample_id) %>%
+  summarise(across(everything(), sum)) %>%
+  column_to_rownames(var = "sample_id")
+
+# Subset metadata to 87 lines
+metadata <- metadata[metadata$cluster_id == "Astro_FB",]
+metadata$cell_count_sample <- scale(metadata$cell_count_sample)
+metadata$cell_count_pseudosample <- NULL
+metadata$cluster_id <- NULL
+
+# Assign the rownames of the metadata to be the sample IDs
+rownames(metadata) <- metadata$sample_id
+head(metadata)
+
+# Check that all of the row names of the metadata are the same and in the same order as the column names of the counts in order to use as input to DESeq2
+all(rownames(metadata) == rownames(counts_sum))
+```
+
+
+# 3. Generate DGEList object, filter genes and normalize
+
+```{r}
+# Create DGEList object
+d0 <- DGEList(as.data.frame(t(counts_sum)), samples = metadata)
+dim(d0)
+
+# Filter genes
+cutoff_counts <- 10
+keep <- rowSums(d0$counts >= cutoff_counts) >= cutoff_sample*ncol(d0$counts)
+d <- d0[keep,] 
+dim(d) # number of genes left
+
+# Normalization factor
+d <- calcNormFactors(d)
+d
+```
+
+
+# 4. Voom transformation and calculation of variance weights
+
+What is voom doing?
+
+Counts are transformed to log2 counts per million reads (CPM), where “per million reads” is defined based on the normalization factors we calculated earlier
+A linear model is fitted to the log2 CPM for each gene, and the residuals are calculated
+A smoothed curve is fitted to the sqrt(residual standard deviation) by average expression (see red line in plot above)
+The smoothed curve is used to obtain weights for each gene and sample that are passed into limma along with the log2 CPMs.
+
+```{r}
+# specify model to fitted
+mm <- model.matrix(as.formula(des), data = d$samples)
+# voom transformation
+y <- voom(d, mm, plot = T)
+```
+
+
+
+# 5. Remove batch effect
+
+```{r, dpi=300, fig.width=12, fig.height=10}
+y2 <- remove3BatchEffects(y, batch = d$samples$X6.Batch, batch2 = d$samples$Sex,
+                          batch3 = d$samples$Status,
+                        covariates = d$samples[,c("Age", "RIN", "Brain.pH", "PMI")])
+
+pc <- pca(y2, removeVar = 0.2)
+cov_pc <- data.frame(cbind(d$samples, pc$rotated[,c(1:10)] ))
+head(cov_pc)
+
+write.csv(pc$rotated[,c(1:10)],
+          file = paste0(basedir, "tables/PCA_noise/", cluster, "_PCAnoise_perc", perc, "_rotated.csv"))
+write.csv(pc$variance,
+          file = paste0(basedir, "tables/PCA_noise/", cluster, "_PCAnoise_perc", perc, "_variance.csv"))
+
+# CCA with PCs fitted on residuals
+# analyze correlation of covariates
+# canonical correlation analysis CCA
+form <- as.formula("~ Status +
+  Age +
+  Sex +
+  Brain.pH + RIN + 
+  PMI + Agonal.score + Mode.of.death +
+  X6.Batch +
+  C1+C2+C3+C4+C5+
+  cell_count_sample +
+  PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10")
+
+# Calculate the correlation coefficients
+C <- canCorPairs(form, cov_pc)
+# C to long format
+C_long <- reshape::melt(C)
+C_long$X1 <- factor(C_long$X1, levels = colnames(C))
+C_long$X2 <- factor(C_long$X2, levels = colnames(C))
+# Plot the results using Canonical correlation
+ggplot(C_long, aes(X1,X2))+
+  geom_tile(aes(fill=value))+
+  geom_text(aes(label = round(value, 2)),
+            size = 3) +
+  xlab("")+
+  ylab("")+
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  scale_fill_gradient(low="yellow", high="red")
+```
+
+
+# 6. Generate DESeq2 object and vst 
+
+Use PC1 from batch corrected data as covariate to account for hidden noise.
+
+```{r}
+# join metadata with PC1 from corrected data
+metadata <- left_join(as.data.frame(d$samples), 
+                          as.data.frame(cov_pc[c("sample_id", "PC1")]), 
+                          by="sample_id")
+
+# 3. DESeq2 object
+dds <- DESeqDataSetFromMatrix(d0$counts, 
+                              colData = metadata, 
+                              design = as.formula(des))
+dds
+
+# Keep only genes expressed in more than specific percentage of samples
+dds <- dds[rowSums(counts(dds) > 10) >= cutoff_sample*ncol(dds), ]
+dds
+
+# Normalization of count data
+vsd <- varianceStabilizingTransformation(dds, blind=FALSE)
+hist(assay(vsd))
+```
+
+# 7. Variance Partition
+
+## 7.1 Variance Partition with covariates and 1 PC on corrected data
+
+```{r, out.width="100%"}
+# Variance Partition formula --> with PC1 from corrected data
+form <- as.formula(paste0(des_varPart, "+PC1"))
+form
+
+# run variance partition
+varPart <- fitExtractVarPartModel(assay(vsd), form, as.data.frame(colData(dds)))
+
+# plot variance partition (Violin plot of variance fraction for each gene and each variable)
+plotVarPart(varPart)
+```
+
+```{r, out.width="100%"}
+# plot percentage of variance explained by each variable
+print("% variance explained by covariates:")
+o <- colSums(varPart)*100/sum(varPart)
+o
+barplot(o, las=2)
+```
